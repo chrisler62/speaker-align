@@ -1,0 +1,32 @@
+[package]
+name = "speaker-align"
+version = "0.1.0"
+edition = "2021"
+description = "Calibration de placement stéréo par analyse comparative micro"
+
+[[bin]]
+name = "speaker-align"
+path = "src/main.rs"
+
+[dependencies]
+# Audio I/O cross-platform
+cpal = "0.15"
+
+# FFT rapide O(n log n)
+rustfft = "6"
+
+# Interface TUI
+ratatui = "0.28"
+crossterm = "0.28"
+
+# Utilitaires
+anyhow = "1"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1   # optimiser même en dev pour le traitement audio
