@@ -36,11 +36,6 @@ pub enum Step {
     Results,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SignalType {
-    Sweep,
-    PinkNoise,
-}
 
 #[derive(Debug, Clone)]
 pub struct HistoryEntry {
@@ -59,7 +54,6 @@ pub enum AudioMsg {
 
 pub struct AppState {
     pub step: Step,
-    pub signal_type: SignalType,
 
     // Données brutes
     pub left_samples: Option<Vec<f32>>,
@@ -102,7 +96,6 @@ impl AppState {
         let (out, inp) = audio::default_device_names();
         AppState {
             step: Step::Idle,
-            signal_type: SignalType::PinkNoise,
             left_samples: None,
             right_samples: None,
             left_test_signal: None,
@@ -133,15 +126,10 @@ impl AppState {
         self.progress = 0.0;
         self.error = None;
 
-        let signal_type = self.signal_type;
         let pre_delay_secs = self.pre_delay_secs;
 
         thread::spawn(move || {
-            // Génère le signal de test
-            let signal = match signal_type {
-                SignalType::Sweep => dsp::generate_sweep(SAMPLE_RATE, SWEEP_DURATION),
-                SignalType::PinkNoise => dsp::generate_pink_noise(SAMPLE_RATE, SWEEP_DURATION),
-            };
+            let signal = dsp::generate_sweep(SAMPLE_RATE, SWEEP_DURATION);
 
             let (prog_tx, prog_rx) = mpsc::channel::<f32>();
 
@@ -232,21 +220,20 @@ impl AppState {
 
         self.step = Step::Analyzing;
 
-        // Délai inter-canal (haute précision ~0.7 mm)
-        let delay = dsp::compute_delay_precise(
-            &left_s,
-            &right_s,
-            SAMPLE_RATE,
-            self.left_test_signal.as_deref(),
-            self.right_test_signal.as_deref(),
-        );
-        self.delay_ms = delay * 1000.0;
-
-        // Distances absolues (sweep uniquement — requiert le signal de référence)
+        // Distances absolues (sweep uniquement — requiert le signal de référence).
+        // On soustrait le pre_delay connu ; la latence système reste mais est
+        // identique pour G et D, donc la différence est acoustiquement juste.
+        let pre_delay_samples = (self.pre_delay_secs * SAMPLE_RATE as f32) as usize;
         self.left_dist_m = self.left_test_signal.as_deref()
-            .and_then(|sig| dsp::compute_speaker_distance(&left_s, sig, SAMPLE_RATE));
+            .and_then(|sig| dsp::compute_speaker_distance(&left_s, sig, SAMPLE_RATE, pre_delay_samples));
         self.right_dist_m = self.right_test_signal.as_deref()
-            .and_then(|sig| dsp::compute_speaker_distance(&right_s, sig, SAMPLE_RATE));
+            .and_then(|sig| dsp::compute_speaker_distance(&right_s, sig, SAMPLE_RATE, pre_delay_samples));
+
+        // Délai inter-canal : différence de distances → annule pre_delay ET latence système
+        self.delay_ms = match (self.left_dist_m, self.right_dist_m) {
+            (Some(l), Some(r)) => (r - l) / 343.0 * 1000.0,
+            _ => 0.0,
+        };
 
         // Différence de niveau (RMS)
         let left_rms = dsp::compute_rms(&left_s);
@@ -380,14 +367,6 @@ impl App {
                         // Réinitialiser
                         (KeyCode::Char('x') | KeyCode::Delete, _) => {
                             state.reset();
-                        }
-
-                        // Changer le type de signal
-                        (KeyCode::Tab, _) if state.step == Step::Idle => {
-                            state.signal_type = match state.signal_type {
-                                SignalType::Sweep => SignalType::PinkNoise,
-                                SignalType::PinkNoise => SignalType::Sweep,
-                            };
                         }
 
                         // Augmenter le délai pré-capture (+0.5s, max 5.0s)

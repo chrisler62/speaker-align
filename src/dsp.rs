@@ -34,30 +34,6 @@ pub fn generate_sweep(sample_rate: u32, duration: f32) -> Vec<f32> {
     buf
 }
 
-// ─── Génération du bruit rose (algorithme de Voss-McCartney) ─────────────────
-
-pub fn generate_pink_noise(sample_rate: u32, duration: f32) -> Vec<f32> {
-    let len = (duration * sample_rate as f32) as usize;
-    let (mut b0, mut b1, mut b2, mut b3, mut b4, mut b5, mut b6) =
-        (0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-    let mut buf = Vec::with_capacity(len);
-
-    for i in 0..len {
-        let white: f32 = rand::random::<f32>() * 2.0 - 1.0;
-        b0 = 0.99886 * b0 + white * 0.0555179;
-        b1 = 0.99332 * b1 + white * 0.0750759;
-        b2 = 0.96900 * b2 + white * 0.1538520;
-        b3 = 0.86650 * b3 + white * 0.3104856;
-        b4 = 0.55000 * b4 + white * 0.5329522;
-        b5 = -0.7616 * b5 - white * 0.0168980;
-        let pink = b0 + b1 + b2 + b3 + b4 + b5 + b6 + white * 0.5362;
-        b6 = white * 0.115926;
-        let t = i as f32 / sample_rate as f32;
-        let env = (t * 10.0).min(1.0) * ((duration - t) * 10.0).min(1.0);
-        buf.push(pink * 0.06 * env);
-    }
-    buf
-}
 
 // ─── FFT avec fenêtre de Hann, moyennée sur les segments ─────────────────────
 
@@ -176,90 +152,6 @@ fn parabolic_interp(y_minus: f32, y_center: f32, y_plus: f32) -> f32 {
     0.5 * (y_minus - y_plus) / denom
 }
 
-// ─── GCC-PHAT (Generalized Cross-Correlation — Phase Transform) ─────────────
-//
-// Corrélation croisée dans le domaine fréquentiel avec normalisation PHAT.
-// Produit un pic ultra-net, insensible aux réflexions.
-
-fn gcc_phat(reference: &[f32], test: &[f32], sample_rate: u32) -> f32 {
-    let total_len = reference.len() + test.len();
-    let fft_len = total_len.next_power_of_two();
-
-    let mut planner = FftPlanner::<f32>::new();
-    let fft_fwd = planner.plan_fft_forward(fft_len);
-    let fft_inv = planner.plan_fft_inverse(fft_len);
-
-    // Zero-pad reference et test
-    let mut ref_buf: Vec<Complex<f32>> = reference
-        .iter()
-        .map(|&x| Complex::new(x, 0.0))
-        .chain(std::iter::repeat_n(Complex::new(0.0, 0.0),fft_len - reference.len()))
-        .collect();
-
-    let mut test_buf: Vec<Complex<f32>> = test
-        .iter()
-        .map(|&x| Complex::new(x, 0.0))
-        .chain(std::iter::repeat_n(Complex::new(0.0, 0.0),fft_len - test.len()))
-        .collect();
-
-    fft_fwd.process(&mut ref_buf);
-    fft_fwd.process(&mut test_buf);
-
-    // Cross-spectre avec normalisation PHAT : R * conj(T) / |R * conj(T)|
-    let mut cross: Vec<Complex<f32>> = ref_buf
-        .iter()
-        .zip(test_buf.iter())
-        .map(|(r, t)| {
-            let product = r * t.conj();
-            let mag = product.norm();
-            if mag > 1e-10 { product / mag } else { Complex::new(0.0, 0.0) }
-        })
-        .collect();
-
-    fft_inv.process(&mut cross);
-
-    // Normaliser la sortie IFFT
-    let inv_n = 1.0 / fft_len as f32;
-    for c in cross.iter_mut() {
-        *c *= inv_n;
-    }
-
-    // Chercher le pic dans la plage ±50ms
-    let max_lag = ((sample_rate as f32 * 0.05) as usize).min(fft_len / 2);
-
-    let mut best_k: usize = 0;
-    let mut best_val = f32::NEG_INFINITY;
-
-    // Lags positifs : indices 0..max_lag
-    for (k, c) in cross.iter().enumerate().take(max_lag + 1) {
-        if c.re > best_val {
-            best_val = c.re;
-            best_k = k;
-        }
-    }
-    // Lags négatifs : indices fft_len-max_lag..fft_len
-    for (k, c) in cross.iter().enumerate().skip(fft_len - max_lag) {
-        if c.re > best_val {
-            best_val = c.re;
-            best_k = k;
-        }
-    }
-
-    // Convertir l'index circulaire en lag signé
-    let lag = if best_k <= fft_len / 2 {
-        best_k as f32
-    } else {
-        best_k as f32 - fft_len as f32
-    };
-
-    // Interpolation parabolique sub-sample
-    let k = best_k;
-    let prev = cross[(k + fft_len - 1) % fft_len].re;
-    let next = cross[(k + 1) % fft_len].re;
-    let delta = parabolic_interp(prev, best_val, next);
-
-    (lag + delta) / sample_rate as f32
-}
 
 // ─── Distance absolue d'une enceinte par déconvolution sweep ────────────────
 //
@@ -273,7 +165,7 @@ fn gcc_phat(reference: &[f32], test: &[f32], sample_rate: u32) -> f32 {
 //   3. Premier passage au-dessus du seuil = arrivée du son direct
 //   4. Interpolation parabolique sub-sample pour la précision
 
-pub fn compute_speaker_distance(capture: &[f32], sweep: &[f32], sample_rate: u32) -> Option<f32> {
+pub fn compute_speaker_distance(capture: &[f32], sweep: &[f32], sample_rate: u32, pre_delay_samples: usize) -> Option<f32> {
     let sweep_len = sweep.len();
     let total_len = capture.len() + sweep_len;
     let fft_len = total_len.next_power_of_two();
@@ -319,14 +211,13 @@ pub fn compute_speaker_distance(capture: &[f32], sweep: &[f32], sample_rate: u32
     let inv_n = 1.0 / fft_len as f32;
 
     // La convolution linéaire de capture (N) avec inverse_sweep (M) produit son pic
-    // à l'indice (M-1) + t_travel dans l'IR — pas à t_travel directement.
-    // Il faut donc décaler la fenêtre de recherche de (sweep_len - 1).
+    // à l'indice (M-1) + pre_delay + latence_système + t_travel dans l'IR.
+    // On décale la fenêtre de (sweep_len-1) puis on cherche sur tout capture.len()
+    // pour couvrir n'importe quel pre_delay ou latence système.
     let offset = sweep_len - 1;
 
-    // Distance maximale réaliste : 20 m → 20/343*48000 ≈ 2800 samples, marge incluse
-    let travel_max = (20.0f32 / 343.0 * sample_rate as f32) as usize + 500;
     let search_start = offset;
-    let search_end = (offset + travel_max).min(ir_buf.len());
+    let search_end = (offset + capture.len()).min(ir_buf.len());
 
     if search_start >= search_end {
         return None;
@@ -353,44 +244,24 @@ pub fn compute_speaker_distance(capture: &[f32], sweep: &[f32], sample_rate: u32
     let peak_idx = (onset..=window_end)
         .max_by(|&a, &b| ir[a].partial_cmp(&ir[b]).unwrap())?;
 
-    // peak_idx est l'indice DANS la fenêtre décalée → directement le temps de trajet
+    // peak_idx est l'indice DANS la fenêtre décalée.
+    // Il vaut : pre_delay_samples + latence_système + t_acoustique.
+    // On soustrait le pre_delay (connu) ; la latence système reste mais est
+    // identique pour G et D → la DIFFÉRENCE est acoustiquement juste.
     let delta = if peak_idx > 0 && peak_idx < ir.len() - 1 {
         parabolic_interp(ir[peak_idx - 1], ir[peak_idx], ir[peak_idx + 1])
     } else {
         0.0
     };
 
-    let time_s = (peak_idx as f32 + delta) / sample_rate as f32;
-    Some(time_s * 343.0) // distance en mètres
+    let net = (peak_idx as f32 + delta) - pre_delay_samples as f32;
+    if net < 0.0 {
+        return None;
+    }
+    let time_s = net / sample_rate as f32;
+    Some(time_s * 343.0) // distance en mètres (inclut encore la latence système)
 }
 
-// ─── Mesure de délai haute précision (~0.7 mm) ──────────────────────────────
-//
-// Si les signaux de test (sweep) sont fournis → déconvolution + interp parabolique
-// Sinon (bruit rose) → GCC-PHAT + interp parabolique
-
-pub fn compute_delay_precise(
-    left_capture: &[f32],
-    right_capture: &[f32],
-    sample_rate: u32,
-    _left_signal: Option<&[f32]>,
-    _right_signal: Option<&[f32]>,
-) -> f32 {
-    // GCC-PHAT direct entre les deux captures pour les deux modes.
-    //
-    // Mode sweep : generate_sweep() est déterministe → les deux captures
-    //   contiennent le même sweep filtré par des chemins acoustiques différents
-    //   → GCC-PHAT trouve le délai inter-canal directement.
-    //
-    // Mode bruit rose : les deux signaux sont des réalisations différentes
-    //   (rand non corrélé) mais la corrélation via l'acoustique de la pièce
-    //   reste utilisable pour estimer un délai approximatif.
-    //
-    // La déconvolution séparée canal par canal n'est pas utilisée ici car elle
-    // compare des temps absolus de captures séquentielles, ce qui donne des
-    // résultats instables (dépend du pic trouvé dans l'IR de chaque canal).
-    gcc_phat(left_capture, right_capture, sample_rate)
-}
 
 // ─── Score global (0–100) ─────────────────────────────────────────────────────
 

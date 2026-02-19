@@ -24,7 +24,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{AppState, HistoryEntry, SignalType, Step},
+    app::{AppState, Step},
     dsp::NUM_BANDS,
 };
 
@@ -64,7 +64,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         .split(area);
 
     draw_header(f, chunks[0], state);
-    draw_signal_selector(f, chunks[1], state);
+    draw_delay_control(f, chunks[1], state);
     draw_capture_controls(f, chunks[2], state);
     draw_progress(f, chunks[3], state);
 
@@ -125,71 +125,28 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(para, area);
 }
 
-// ─── Sélecteur de signal ──────────────────────────────────────────────────────
+// ─── Contrôle du délai pré-capture ───────────────────────────────────────────
 
-fn draw_signal_selector(f: &mut Frame, area: Rect, state: &AppState) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(38),
-            Constraint::Percentage(38),
-            Constraint::Percentage(24),
-        ])
-        .split(area);
-
-    let options = [
-        (SignalType::Sweep, "◈ SWEEP SINUS", "20Hz → 20kHz"),
-        (SignalType::PinkNoise, "◈ BRUIT ROSE", "Spectre complet"),
-    ];
-
-    for (i, (sig, label, desc)) in options.iter().enumerate() {
-        let selected = state.signal_type == *sig;
-        let color = if selected { GREEN } else { GRAY };
-
-        let content = Line::from(vec![
-            Span::styled(
-                format!("  {} ", label),
-                Style::default().fg(color).add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() }),
-            ),
-            Span::styled(
-                format!("({})", desc),
-                Style::default().fg(GRAY),
-            ),
-        ]);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(if selected {
-                Color::Rgb(0, 80, 50)
-            } else {
-                Color::Rgb(35, 35, 50)
-            }))
-            .style(Style::default().bg(if selected {
-                Color::Rgb(0, 20, 15)
-            } else {
-                DARK
-            }));
-
-        let para = Paragraph::new(content).block(block);
-        f.render_widget(para, cols[i]);
-    }
-
-    // ── Délai pré-capture ──
-    let delay_block = Block::default()
+fn draw_delay_control(f: &mut Frame, area: Rect, state: &AppState) {
+    let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled(" Délai ", Style::default().fg(GRAY)))
+        .title(Span::styled(" ◈ SWEEP SINUS 20 Hz → 20 kHz  —  Délai pré-capture ", Style::default().fg(GRAY)))
         .border_style(Style::default().fg(Color::Rgb(35, 35, 50)));
 
-    let delay_content = Line::from(vec![
-        Span::styled(" [-] ", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+    let content = Line::from(vec![
+        Span::styled("  [-] ", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
         Span::styled(
-            format!("{:.1}s", state.pre_delay_secs),
+            format!("{:.1} s", state.pre_delay_secs),
             Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" [+]", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled(" [+]  ", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "laisser le temps au bruit transitoire de se dissiper avant la capture",
+            Style::default().fg(GRAY),
+        ),
     ]);
 
-    f.render_widget(Paragraph::new(delay_content).block(delay_block), cols[2]);
+    f.render_widget(Paragraph::new(content).block(block), area);
 }
 
 // ─── Boutons de capture ───────────────────────────────────────────────────────
@@ -302,8 +259,6 @@ fn draw_progress(f: &mut Frame, area: Rect, state: &AppState) {
             Line::from(vec![
                 Span::styled("  ⚡ Les deux enceintes sont capturées — ", Style::default().fg(GRAY)),
                 Span::styled("[A] Analyser", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
-                Span::styled(" ou ", Style::default().fg(GRAY)),
-                Span::styled("[Tab] Changer le signal", Style::default().fg(GRAY)),
             ])
         } else {
             Line::from(Span::styled(
@@ -716,8 +671,7 @@ fn draw_help(f: &mut Frame, area: Rect, state: &AppState) {
         ("[L]", "Capturer gauche"),
         ("[R]", "Capturer droite"),
         ("[A]", "Analyser"),
-        ("[Tab]", "Signal"),
-        ("[+/-]", "Délai"),
+        ("[+/-]", "Délai pré-capture"),
         ("[X]", "Réinitialiser"),
         ("[Q]", "Quitter"),
     ];
