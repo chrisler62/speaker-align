@@ -487,6 +487,20 @@ fn draw_score_metrics(f: &mut Frame, area: Rect, state: &AppState) {
         let col = score_color(score);
         let rating = if score >= 85 { "EXCELLENT" } else if score >= 60 { "AJUSTABLE" } else { "À CORRIGER" };
 
+        let dist_line = match (state.left_dist_m, state.right_dist_m) {
+            (Some(l), Some(r)) => Line::from(vec![
+                Span::styled("  Distances  ", Style::default().fg(GRAY)),
+                Span::styled("G ", Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{:.2} m", l), Style::default().fg(GREEN)),
+                Span::styled("  D ", Style::default().fg(ORANGE).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{:.2} m", r), Style::default().fg(ORANGE)),
+            ]),
+            _ => Line::from(Span::styled(
+                "  Distances  — sweep requis",
+                Style::default().fg(GRAY),
+            )),
+        };
+
         let lines = vec![
             Line::from(vec![
                 Span::styled(
@@ -495,10 +509,10 @@ fn draw_score_metrics(f: &mut Frame, area: Rect, state: &AppState) {
                 ),
                 Span::styled(rating, Style::default().fg(col)),
             ]),
-            meter_line("Délai", state.delay_ms, "ms", 5.0, 0.2, CYAN),
+            dist_line,
+            meter_line_delay("Délai", state.delay_ms, 5.0, 0.2, CYAN),
             meter_line("Niveau", state.level_diff_db, "dB", 10.0, 0.5, ORANGE),
             meter_line("Spectre", state.freq_tilt, "dB", 10.0, 1.0, PURPLE),
-            Line::from(""),
         ];
 
         f.render_widget(Paragraph::new(lines).block(block), area);
@@ -537,6 +551,28 @@ fn meter_line(label: &str, value: f32, unit: &str, max: f32, tolerance: f32, col
     ])
 }
 
+fn meter_line_delay(label: &str, value: f32, max: f32, tolerance: f32, color: Color) -> Line<'static> {
+    let is_good = value.abs() <= tolerance;
+    let is_ok = value.abs() <= tolerance * 2.0;
+    let status_color = if is_good { GREEN } else if is_ok { YELLOW } else { RED };
+    let sign = if value >= 0.0 { "+" } else { "" };
+    let bar_len = 12usize;
+    let filled = ((value.abs() / max).min(1.0) * bar_len as f32) as usize;
+    let bar: String = "█".repeat(filled) + &"░".repeat(bar_len - filled);
+
+    Line::from(vec![
+        Span::styled(
+            format!("  {:<8}", label),
+            Style::default().fg(GRAY),
+        ),
+        Span::styled(bar, Style::default().fg(color)),
+        Span::styled(
+            format!(" {}{:.3} ms", sign, value),
+            Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
 fn draw_recommendations(f: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -562,14 +598,20 @@ fn draw_recommendations(f: &mut Frame, area: Rect, state: &AppState) {
         } else {
             "Éloigner l'enceinte droite"
         };
-        let dist = (state.delay_ms.abs() * 0.343).abs();
+        // delay_ms * 34.3 cm/ms = distance en cm  (vitesse du son ≈ 343 m/s)
+        let dist_cm = state.delay_ms.abs() * 34.3;
         let sev = if state.delay_ms.abs() > 0.5 { RED } else { YELLOW };
         guides.push(Line::from(vec![
             Span::styled(format!("  {} ", icon), Style::default().fg(sev).add_modifier(Modifier::BOLD)),
             Span::styled(action.to_string(), Style::default().fg(WHITE)),
         ]));
+        let dist_label = if dist_cm < 1.0 {
+            format!("    Δ distance ≈ {:.1} mm", dist_cm * 10.0)
+        } else {
+            format!("    Δ distance ≈ {:.1} cm", dist_cm)
+        };
         guides.push(Line::from(Span::styled(
-            format!("    Δ distance ≈ {:.1} cm", dist),
+            dist_label,
             Style::default().fg(GRAY),
         )));
     }

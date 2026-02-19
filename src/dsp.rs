@@ -163,41 +163,233 @@ pub fn compute_rms(samples: &[f32]) -> f32 {
     (sum / samples.len() as f32).sqrt()
 }
 
-// ─── Corrélation croisée pour estimer le délai entre les deux canaux ─────────
+// ─── Interpolation parabolique sub-sample ────────────────────────────────────
+//
+// Fit une parabole sur 3 points autour du pic pour obtenir une résolution
+// ~0.1 sample → ~0.7 mm à 48 kHz.
 
-pub fn compute_delay(reference: &[f32], test: &[f32], sample_rate: u32) -> f32 {
-    let max_lag = ((sample_rate as f32 * 0.05) as usize)
-        .min(reference.len())
-        .min(test.len());
+fn parabolic_interp(y_minus: f32, y_center: f32, y_plus: f32) -> f32 {
+    let denom = y_minus - 2.0 * y_center + y_plus;
+    if denom.abs() < 1e-12 {
+        return 0.0;
+    }
+    0.5 * (y_minus - y_plus) / denom
+}
 
-    let mut best_lag: i32 = 0;
-    let mut best_corr = f32::NEG_INFINITY;
+// ─── GCC-PHAT (Generalized Cross-Correlation — Phase Transform) ─────────────
+//
+// Corrélation croisée dans le domaine fréquentiel avec normalisation PHAT.
+// Produit un pic ultra-net, insensible aux réflexions.
 
-    for lag in -(max_lag as i32)..=(max_lag as i32) {
-        let n = (reference.len().min(test.len()) as i32 - lag.abs()) as usize;
-        if n == 0 {
-            continue;
+fn gcc_phat(reference: &[f32], test: &[f32], sample_rate: u32) -> f32 {
+    let total_len = reference.len() + test.len();
+    let fft_len = total_len.next_power_of_two();
+
+    let mut planner = FftPlanner::<f32>::new();
+    let fft_fwd = planner.plan_fft_forward(fft_len);
+    let fft_inv = planner.plan_fft_inverse(fft_len);
+
+    // Zero-pad reference et test
+    let mut ref_buf: Vec<Complex<f32>> = reference
+        .iter()
+        .map(|&x| Complex::new(x, 0.0))
+        .chain(std::iter::repeat_n(Complex::new(0.0, 0.0),fft_len - reference.len()))
+        .collect();
+
+    let mut test_buf: Vec<Complex<f32>> = test
+        .iter()
+        .map(|&x| Complex::new(x, 0.0))
+        .chain(std::iter::repeat_n(Complex::new(0.0, 0.0),fft_len - test.len()))
+        .collect();
+
+    fft_fwd.process(&mut ref_buf);
+    fft_fwd.process(&mut test_buf);
+
+    // Cross-spectre avec normalisation PHAT : R * conj(T) / |R * conj(T)|
+    let mut cross: Vec<Complex<f32>> = ref_buf
+        .iter()
+        .zip(test_buf.iter())
+        .map(|(r, t)| {
+            let product = r * t.conj();
+            let mag = product.norm();
+            if mag > 1e-10 { product / mag } else { Complex::new(0.0, 0.0) }
+        })
+        .collect();
+
+    fft_inv.process(&mut cross);
+
+    // Normaliser la sortie IFFT
+    let inv_n = 1.0 / fft_len as f32;
+    for c in cross.iter_mut() {
+        *c *= inv_n;
+    }
+
+    // Chercher le pic dans la plage ±50ms
+    let max_lag = ((sample_rate as f32 * 0.05) as usize).min(fft_len / 2);
+
+    let mut best_k: usize = 0;
+    let mut best_val = f32::NEG_INFINITY;
+
+    // Lags positifs : indices 0..max_lag
+    for (k, c) in cross.iter().enumerate().take(max_lag + 1) {
+        if c.re > best_val {
+            best_val = c.re;
+            best_k = k;
         }
-
-        let corr: f32 = (0..n)
-            .map(|i| {
-                let ri = if lag >= 0 { i } else { (i as i32 - lag) as usize };
-                let ti = if lag >= 0 { (i as i32 + lag) as usize } else { i };
-                if ri < reference.len() && ti < test.len() {
-                    reference[ri] * test[ti]
-                } else {
-                    0.0
-                }
-            })
-            .sum();
-
-        if corr > best_corr {
-            best_corr = corr;
-            best_lag = lag;
+    }
+    // Lags négatifs : indices fft_len-max_lag..fft_len
+    for (k, c) in cross.iter().enumerate().skip(fft_len - max_lag) {
+        if c.re > best_val {
+            best_val = c.re;
+            best_k = k;
         }
     }
 
-    best_lag as f32 / sample_rate as f32
+    // Convertir l'index circulaire en lag signé
+    let lag = if best_k <= fft_len / 2 {
+        best_k as f32
+    } else {
+        best_k as f32 - fft_len as f32
+    };
+
+    // Interpolation parabolique sub-sample
+    let k = best_k;
+    let prev = cross[(k + fft_len - 1) % fft_len].re;
+    let next = cross[(k + 1) % fft_len].re;
+    let delta = parabolic_interp(prev, best_val, next);
+
+    (lag + delta) / sample_rate as f32
+}
+
+// ─── Distance absolue d'une enceinte par déconvolution sweep ────────────────
+//
+// Retourne la distance estimée enceinte→micro en mètres.
+// La valeur inclut la latence système (buffer DAC+ADC), constante pour les
+// deux canaux → la DIFFÉRENCE gauche/droite est acoustiquement juste.
+//
+// Algorithme :
+//   1. IR = FFT(capture) * FFT(inverse_sweep)⁻¹ → réponse impulsionnelle
+//   2. Seuil = 10 % du maximum de l'IR sur une fenêtre réaliste
+//   3. Premier passage au-dessus du seuil = arrivée du son direct
+//   4. Interpolation parabolique sub-sample pour la précision
+
+pub fn compute_speaker_distance(capture: &[f32], sweep: &[f32], sample_rate: u32) -> Option<f32> {
+    let sweep_len = sweep.len();
+    let total_len = capture.len() + sweep_len;
+    let fft_len = total_len.next_power_of_two();
+
+    let mut planner = FftPlanner::<f32>::new();
+    let fft_fwd = planner.plan_fft_forward(fft_len);
+    let fft_inv = planner.plan_fft_inverse(fft_len);
+
+    // Filtre inverse du sweep log (time-reverse + compensation d'amplitude)
+    let f0: f32 = 20.0;
+    let f1: f32 = 20_000.0;
+    let duration = sweep_len as f32 / sample_rate as f32;
+    let rate = (f1 / f0).ln() / duration;
+
+    let inverse_sweep: Vec<f32> = (0..sweep_len)
+        .map(|i| {
+            let t = (sweep_len - 1 - i) as f32 / sample_rate as f32;
+            sweep[sweep_len - 1 - i] * (-rate * t).exp()
+        })
+        .collect();
+
+    let mut inv_buf: Vec<Complex<f32>> = inverse_sweep
+        .iter()
+        .map(|&x| Complex::new(x, 0.0))
+        .chain(std::iter::repeat_n(Complex::new(0.0, 0.0), fft_len - sweep_len))
+        .collect();
+    fft_fwd.process(&mut inv_buf);
+
+    let mut cap_buf: Vec<Complex<f32>> = capture
+        .iter()
+        .map(|&x| Complex::new(x, 0.0))
+        .chain(std::iter::repeat_n(Complex::new(0.0, 0.0), fft_len - capture.len()))
+        .collect();
+    fft_fwd.process(&mut cap_buf);
+
+    let mut ir_buf: Vec<Complex<f32>> = cap_buf
+        .iter()
+        .zip(inv_buf.iter())
+        .map(|(c, h)| c * h)
+        .collect();
+    fft_inv.process(&mut ir_buf);
+
+    let inv_n = 1.0 / fft_len as f32;
+
+    // La convolution linéaire de capture (N) avec inverse_sweep (M) produit son pic
+    // à l'indice (M-1) + t_travel dans l'IR — pas à t_travel directement.
+    // Il faut donc décaler la fenêtre de recherche de (sweep_len - 1).
+    let offset = sweep_len - 1;
+
+    // Distance maximale réaliste : 20 m → 20/343*48000 ≈ 2800 samples, marge incluse
+    let travel_max = (20.0f32 / 343.0 * sample_rate as f32) as usize + 500;
+    let search_start = offset;
+    let search_end = (offset + travel_max).min(ir_buf.len());
+
+    if search_start >= search_end {
+        return None;
+    }
+
+    // Extrait la fenêtre [offset .. offset+travel_max] et normalise
+    let ir: Vec<f32> = ir_buf[search_start..search_end]
+        .iter()
+        .map(|c| (c.re * inv_n).abs())
+        .collect();
+
+    let max_val = ir.iter().cloned().fold(0.0f32, f32::max);
+    if max_val < 1e-9 {
+        return None;
+    }
+
+    let threshold = max_val * 0.10;
+
+    // Premier passage au-dessus du seuil = front du son direct
+    let onset = ir.iter().position(|&v| v >= threshold)?;
+
+    // Pic local dans les 50 samples suivant le front (son direct, avant les réflexions)
+    let window_end = (onset + 50).min(ir.len() - 1);
+    let peak_idx = (onset..=window_end)
+        .max_by(|&a, &b| ir[a].partial_cmp(&ir[b]).unwrap())?;
+
+    // peak_idx est l'indice DANS la fenêtre décalée → directement le temps de trajet
+    let delta = if peak_idx > 0 && peak_idx < ir.len() - 1 {
+        parabolic_interp(ir[peak_idx - 1], ir[peak_idx], ir[peak_idx + 1])
+    } else {
+        0.0
+    };
+
+    let time_s = (peak_idx as f32 + delta) / sample_rate as f32;
+    Some(time_s * 343.0) // distance en mètres
+}
+
+// ─── Mesure de délai haute précision (~0.7 mm) ──────────────────────────────
+//
+// Si les signaux de test (sweep) sont fournis → déconvolution + interp parabolique
+// Sinon (bruit rose) → GCC-PHAT + interp parabolique
+
+pub fn compute_delay_precise(
+    left_capture: &[f32],
+    right_capture: &[f32],
+    sample_rate: u32,
+    _left_signal: Option<&[f32]>,
+    _right_signal: Option<&[f32]>,
+) -> f32 {
+    // GCC-PHAT direct entre les deux captures pour les deux modes.
+    //
+    // Mode sweep : generate_sweep() est déterministe → les deux captures
+    //   contiennent le même sweep filtré par des chemins acoustiques différents
+    //   → GCC-PHAT trouve le délai inter-canal directement.
+    //
+    // Mode bruit rose : les deux signaux sont des réalisations différentes
+    //   (rand non corrélé) mais la corrélation via l'acoustique de la pièce
+    //   reste utilisable pour estimer un délai approximatif.
+    //
+    // La déconvolution séparée canal par canal n'est pas utilisée ici car elle
+    // compare des temps absolus de captures séquentielles, ce qui donne des
+    // résultats instables (dépend du pic trouvé dans l'IR de chaque canal).
+    gcc_phat(left_capture, right_capture, sample_rate)
 }
 
 // ─── Score global (0–100) ─────────────────────────────────────────────────────

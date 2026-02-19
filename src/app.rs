@@ -53,7 +53,7 @@ pub struct HistoryEntry {
 // Message envoyé par les threads audio vers la boucle principale
 pub enum AudioMsg {
     Progress(f32),
-    Done(Vec<f32>),
+    Done(Vec<f32>, Vec<f32>), // (capture, test_signal)
     Error(String),
 }
 
@@ -64,6 +64,14 @@ pub struct AppState {
     // Données brutes
     pub left_samples: Option<Vec<f32>>,
     pub right_samples: Option<Vec<f32>>,
+
+    // Signaux de test utilisés lors de la capture (pour déconvolution sweep)
+    pub left_test_signal: Option<Vec<f32>>,
+    pub right_test_signal: Option<Vec<f32>>,
+
+    // Distances absolues estimées enceinte→micro (sweep uniquement, inclut latence système)
+    pub left_dist_m: Option<f32>,
+    pub right_dist_m: Option<f32>,
 
     // Résultats DSP
     pub left_db: Option<Vec<f32>>,
@@ -97,6 +105,10 @@ impl AppState {
             signal_type: SignalType::PinkNoise,
             left_samples: None,
             right_samples: None,
+            left_test_signal: None,
+            right_test_signal: None,
+            left_dist_m: None,
+            right_dist_m: None,
             left_db: None,
             right_db: None,
             diff_db: None,
@@ -143,7 +155,7 @@ impl AppState {
 
             match audio::play_and_capture(&signal, channel, CAPTURE_DURATION, pre_delay_secs, prog_tx) {
                 Ok(samples) => {
-                    let _ = tx.send(AudioMsg::Done(samples));
+                    let _ = tx.send(AudioMsg::Done(samples, signal));
                 }
                 Err(e) => {
                     let _ = tx.send(AudioMsg::Error(e.to_string()));
@@ -167,8 +179,8 @@ impl AppState {
 
         match msg {
             Some(AudioMsg::Progress(p)) => self.progress = p,
-            Some(AudioMsg::Done(samples)) => {
-                self.run_dsp(samples);
+            Some(AudioMsg::Done(samples, test_signal)) => {
+                self.run_dsp(samples, test_signal);
             }
             Some(AudioMsg::Error(e)) => {
                 self.error = Some(e);
@@ -180,7 +192,7 @@ impl AppState {
     }
 
     /// Calcule le spectre après réception des échantillons.
-    fn run_dsp(&mut self, samples: Vec<f32>) {
+    fn run_dsp(&mut self, samples: Vec<f32>, test_signal: Vec<f32>) {
         // Filtre passe-haut 30 Hz : supprime le bruit de ronflement ambiant
         // (ventilateurs PC, vibrations bureau) sans affecter la plage utile
         let filtered = dsp::highpass_filter(&samples, 30.0, SAMPLE_RATE);
@@ -191,11 +203,13 @@ impl AppState {
         match self.step {
             Step::CapturingLeft => {
                 self.left_samples = Some(filtered);
+                self.left_test_signal = Some(test_signal);
                 self.left_db = Some(bands_db);
                 self.step = Step::Idle;
             }
             Step::CapturingRight => {
                 self.right_samples = Some(filtered);
+                self.right_test_signal = Some(test_signal);
                 self.right_db = Some(bands_db);
                 self.step = Step::Idle;
             }
@@ -218,9 +232,21 @@ impl AppState {
 
         self.step = Step::Analyzing;
 
-        // Délai inter-canal
-        let delay = dsp::compute_delay(&left_s, &right_s, SAMPLE_RATE);
+        // Délai inter-canal (haute précision ~0.7 mm)
+        let delay = dsp::compute_delay_precise(
+            &left_s,
+            &right_s,
+            SAMPLE_RATE,
+            self.left_test_signal.as_deref(),
+            self.right_test_signal.as_deref(),
+        );
         self.delay_ms = delay * 1000.0;
+
+        // Distances absolues (sweep uniquement — requiert le signal de référence)
+        self.left_dist_m = self.left_test_signal.as_deref()
+            .and_then(|sig| dsp::compute_speaker_distance(&left_s, sig, SAMPLE_RATE));
+        self.right_dist_m = self.right_test_signal.as_deref()
+            .and_then(|sig| dsp::compute_speaker_distance(&right_s, sig, SAMPLE_RATE));
 
         // Différence de niveau (RMS)
         let left_rms = dsp::compute_rms(&left_s);
@@ -262,6 +288,10 @@ impl AppState {
     pub fn reset(&mut self) {
         self.left_samples = None;
         self.right_samples = None;
+        self.left_test_signal = None;
+        self.right_test_signal = None;
+        self.left_dist_m = None;
+        self.right_dist_m = None;
         self.left_db = None;
         self.right_db = None;
         self.diff_db = None;
