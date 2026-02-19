@@ -22,11 +22,13 @@ pub enum Channel {
 
 /// Lance la lecture du signal `signal` sur le canal choisi,
 /// et capture simultanément le microphone pendant `capture_secs` secondes.
+/// `pre_delay_secs` : pause silencieuse avant le démarrage (évite d'enregistrer la frappe clavier).
 /// Retourne les échantillons capturés (mono f32, taux = SAMPLE_RATE).
 pub fn play_and_capture(
     signal: &[f32],
     channel: Channel,
     capture_secs: f32,
+    pre_delay_secs: f32,
     progress_tx: std::sync::mpsc::Sender<f32>,
 ) -> Result<Vec<f32>> {
     let host = cpal::default_host();
@@ -93,6 +95,11 @@ pub fn play_and_capture(
     )?;
 
     // ── Synchronisation ─────────────────────────────────────────────────────
+    // Pause avant démarrage pour laisser le bruit de frappe se dissiper
+    if pre_delay_secs > 0.0 {
+        std::thread::sleep(Duration::from_secs_f32(pre_delay_secs));
+    }
+
     out_stream.play()?;
     in_stream.play()?;
 

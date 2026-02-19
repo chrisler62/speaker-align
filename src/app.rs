@@ -82,6 +82,9 @@ pub struct AppState {
     pub out_device: String,
     pub in_device: String,
 
+    // Délai pré-capture (secondes) — évite d'enregistrer la frappe clavier
+    pub pre_delay_secs: f32,
+
     // Canal de communication inter-thread
     pub audio_rx: Option<mpsc::Receiver<AudioMsg>>,
 }
@@ -91,7 +94,7 @@ impl AppState {
         let (out, inp) = audio::default_device_names();
         AppState {
             step: Step::Idle,
-            signal_type: SignalType::Sweep,
+            signal_type: SignalType::PinkNoise,
             left_samples: None,
             right_samples: None,
             left_db: None,
@@ -106,6 +109,7 @@ impl AppState {
             history: Vec::new(),
             out_device: out,
             in_device: inp,
+            pre_delay_secs: 1.0,
             audio_rx: None,
         }
     }
@@ -118,6 +122,7 @@ impl AppState {
         self.error = None;
 
         let signal_type = self.signal_type;
+        let pre_delay_secs = self.pre_delay_secs;
 
         thread::spawn(move || {
             // Génère le signal de test
@@ -136,7 +141,7 @@ impl AppState {
                 }
             });
 
-            match audio::play_and_capture(&signal, channel, CAPTURE_DURATION, prog_tx) {
+            match audio::play_and_capture(&signal, channel, CAPTURE_DURATION, pre_delay_secs, prog_tx) {
                 Ok(samples) => {
                     let _ = tx.send(AudioMsg::Done(samples));
                 }
@@ -176,18 +181,21 @@ impl AppState {
 
     /// Calcule le spectre après réception des échantillons.
     fn run_dsp(&mut self, samples: Vec<f32>) {
-        let spectrum = dsp::compute_fft(&samples);
+        // Filtre passe-haut 30 Hz : supprime le bruit de ronflement ambiant
+        // (ventilateurs PC, vibrations bureau) sans affecter la plage utile
+        let filtered = dsp::highpass_filter(&samples, 30.0, SAMPLE_RATE);
+        let spectrum = dsp::compute_fft(&filtered);
         let bands = dsp::spectrum_to_bands(&spectrum, SAMPLE_RATE, NUM_BANDS);
         let bands_db = dsp::bands_to_db(&bands);
 
         match self.step {
             Step::CapturingLeft => {
-                self.left_samples = Some(samples);
+                self.left_samples = Some(filtered);
                 self.left_db = Some(bands_db);
                 self.step = Step::Idle;
             }
             Step::CapturingRight => {
-                self.right_samples = Some(samples);
+                self.right_samples = Some(filtered);
                 self.right_db = Some(bands_db);
                 self.step = Step::Idle;
             }
@@ -350,6 +358,18 @@ impl App {
                                 SignalType::Sweep => SignalType::PinkNoise,
                                 SignalType::PinkNoise => SignalType::Sweep,
                             };
+                        }
+
+                        // Augmenter le délai pré-capture (+0.5s, max 5.0s)
+                        (KeyCode::Char('+') | KeyCode::Char('='), _)
+                            if state.step == Step::Idle =>
+                        {
+                            state.pre_delay_secs = (state.pre_delay_secs + 0.5).min(5.0);
+                        }
+
+                        // Diminuer le délai pré-capture (-0.5s, min 0.0s)
+                        (KeyCode::Char('-'), _) if state.step == Step::Idle => {
+                            state.pre_delay_secs = (state.pre_delay_secs - 0.5).max(0.0);
                         }
 
                         _ => {}

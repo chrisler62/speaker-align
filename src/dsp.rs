@@ -135,6 +135,27 @@ pub fn bands_to_db(bands: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+// ─── Filtre passe-haut (IIR 1er ordre) ───────────────────────────────────────
+//
+// Élimine le bruit de ronflement ambiant (ventilateurs, vibrations sol/bureau)
+// sans affecter la plage utile des enceintes (> 80 Hz).
+// Cutoff par défaut : 30 Hz.
+
+pub fn highpass_filter(samples: &[f32], cutoff_hz: f32, sample_rate: u32) -> Vec<f32> {
+    let alpha = 1.0 / (1.0 + 2.0 * PI * cutoff_hz / sample_rate as f32);
+    let mut out = Vec::with_capacity(samples.len());
+    let mut prev_in = 0.0f32;
+    let mut prev_out = 0.0f32;
+
+    for &x in samples {
+        let y = alpha * (prev_out + x - prev_in);
+        prev_in = x;
+        prev_out = y;
+        out.push(y);
+    }
+    out
+}
+
 // ─── RMS ─────────────────────────────────────────────────────────────────────
 
 pub fn compute_rms(samples: &[f32]) -> f32 {

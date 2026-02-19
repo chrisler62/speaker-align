@@ -130,7 +130,11 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState) {
 fn draw_signal_selector(f: &mut Frame, area: Rect, state: &AppState) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(38),
+            Constraint::Percentage(38),
+            Constraint::Percentage(24),
+        ])
         .split(area);
 
     let options = [
@@ -169,6 +173,23 @@ fn draw_signal_selector(f: &mut Frame, area: Rect, state: &AppState) {
         let para = Paragraph::new(content).block(block);
         f.render_widget(para, cols[i]);
     }
+
+    // ── Délai pré-capture ──
+    let delay_block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(" Délai ", Style::default().fg(GRAY)))
+        .border_style(Style::default().fg(Color::Rgb(35, 35, 50)));
+
+    let delay_content = Line::from(vec![
+        Span::styled(" [-] ", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{:.1}s", state.pre_delay_secs),
+            Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" [+]", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+    ]);
+
+    f.render_widget(Paragraph::new(delay_content).block(delay_block), cols[2]);
 }
 
 // ─── Boutons de capture ───────────────────────────────────────────────────────
@@ -256,6 +277,12 @@ fn draw_progress(f: &mut Frame, area: Rect, state: &AppState) {
         };
         let color = if state.step == Step::CapturingLeft { GREEN } else { ORANGE };
 
+        let gauge_label = if state.progress < 0.01 && state.pre_delay_secs > 0.0 {
+            format!("Pause {:.1}s…", state.pre_delay_secs)
+        } else {
+            format!("{:.0}%", state.progress * 100.0)
+        };
+
         let gauge = Gauge::default()
             .block(
                 Block::default()
@@ -265,7 +292,7 @@ fn draw_progress(f: &mut Frame, area: Rect, state: &AppState) {
             )
             .gauge_style(Style::default().fg(color).bg(Color::Rgb(10, 10, 20)))
             .ratio(state.progress as f64)
-            .label(format!("{:.0}%", state.progress * 100.0));
+            .label(gauge_label);
 
         f.render_widget(gauge, area);
     } else {
@@ -648,6 +675,7 @@ fn draw_help(f: &mut Frame, area: Rect, state: &AppState) {
         ("[R]", "Capturer droite"),
         ("[A]", "Analyser"),
         ("[Tab]", "Signal"),
+        ("[+/-]", "Délai"),
         ("[X]", "Réinitialiser"),
         ("[Q]", "Quitter"),
     ];
